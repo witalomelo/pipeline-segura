@@ -1,0 +1,257 @@
+name: Pipeline Segura
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+# packages:write permite publicar no GHCR.
+# id-token:write permite que o Cosign obtenha o token OIDC do GitHub.
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  secure-build:
+    name: Build, Scan, SBOM e Assinatura
+    runs-on: ubuntu-latest
+
+    outputs:
+      image-ref: ${{ steps.publish.outputs.image_ref }}
+
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Definir nomes da imagem
+        shell: bash
+        run: |
+          echo "LOCAL_IMAGE=secure-app:${GITHUB_SHA}" >> "$GITHUB_ENV"
+
+          # O GHCR exige o nome da imagem em letras minúsculas.
+          IMAGE_NAME="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "IMAGE_NAME=${IMAGE_NAME}" >> "$GITHUB_ENV"
+
+          mkdir -p "$HOME/.cache/trivy"
+          mkdir -p artifacts
+
+      # -------------------------------------------------------
+      # 1. BUILD
+      # -------------------------------------------------------
+
+      - name: Construir imagem Docker
+        run: |
+          docker build \
+            --pull \
+            --tag "$LOCAL_IMAGE" \
+            .
+
+          docker image inspect "$LOCAL_IMAGE"
+
+      # -------------------------------------------------------
+      # 2. DOCKLE / CIS DOCKER BENCHMARK
+      # -------------------------------------------------------
+
+      - name: Validar imagem com Dockle
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            goodwithtech/dockle:v0.4.15 \
+            --exit-code 1 \
+            --exit-level fatal \
+            "$LOCAL_IMAGE"
+
+      # -------------------------------------------------------
+      # 3. TRIVY — CVEs CRITICAL
+      # -------------------------------------------------------
+
+      - name: Verificar vulnerabilidades CRITICAL com Trivy
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.cache/trivy:/root/.cache/" \
+            aquasec/trivy:0.71.2 \
+            image \
+            --scanners vuln \
+            --severity CRITICAL \
+            --exit-code 1 \
+            --no-progress \
+            "$LOCAL_IMAGE"
+
+      # -------------------------------------------------------
+      # 4. TRIVY — SECRETS EMBUTIDOS
+      # -------------------------------------------------------
+
+      - name: Verificar secrets embutidos com Trivy
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.cache/trivy:/root/.cache/" \
+            aquasec/trivy:0.71.2 \
+            image \
+            --scanners secret \
+            --exit-code 1 \
+            --no-progress \
+            "$LOCAL_IMAGE"
+
+      # -------------------------------------------------------
+      # 5. SBOM CYCLONEDX
+      # -------------------------------------------------------
+
+      - name: Gerar SBOM CycloneDX
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.cache/trivy:/root/.cache/" \
+            -v "$PWD/artifacts:/output" \
+            aquasec/trivy:0.71.2 \
+            image \
+            --format cyclonedx \
+            --output /output/sbom.cdx.json \
+            --no-progress \
+            "$LOCAL_IMAGE"
+
+          sudo chown -R "$(id -u):$(id -g)" artifacts
+
+          test -s artifacts/sbom.cdx.json
+
+      - name: Publicar SBOM como artefato do build
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx-${{ github.sha }}
+          path: artifacts/sbom.cdx.json
+          if-no-files-found: error
+          retention-days: 30
+
+      # Os passos abaixo só acontecem após merge/push na main.
+      # Em pull requests são executados apenas build e validações.
+
+      # -------------------------------------------------------
+      # 6. PUBLICAÇÃO NO GHCR
+      # -------------------------------------------------------
+
+      - name: Login no GitHub Container Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publicar imagem no GHCR
+        id: publish
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SHA_TAG="${IMAGE_NAME}:${GITHUB_SHA}"
+          LATEST_TAG="${IMAGE_NAME}:latest"
+
+          docker tag "$LOCAL_IMAGE" "$SHA_TAG"
+          docker tag "$LOCAL_IMAGE" "$LATEST_TAG"
+
+          docker push "$SHA_TAG" | tee /tmp/docker-push.log
+          docker push "$LATEST_TAG"
+
+          DIGEST="$(
+            sed -n \
+              's/.*digest: \(sha256:[a-f0-9]\{64\}\).*/\1/p' \
+              /tmp/docker-push.log |
+            tail -n 1
+          )"
+
+          if [ -z "$DIGEST" ]; then
+            echo "Não foi possível obter o digest da imagem."
+            exit 1
+          fi
+
+          IMAGE_REF="${IMAGE_NAME}@${DIGEST}"
+
+          echo "IMAGE_REF=${IMAGE_REF}" >> "$GITHUB_ENV"
+          echo "image_ref=${IMAGE_REF}" >> "$GITHUB_OUTPUT"
+
+          echo "Imagem publicada: ${IMAGE_REF}"
+
+      # -------------------------------------------------------
+      # 7. COSIGN KEYLESS
+      # -------------------------------------------------------
+
+      - name: Instalar Cosign
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: sigstore/cosign-installer@v4.1.2
+
+      - name: Assinar imagem com Cosign keyless
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          cosign sign \
+            --yes \
+            "$IMAGE_REF"
+
+      # -------------------------------------------------------
+      # 8. ATESTAR O SBOM
+      # -------------------------------------------------------
+
+      - name: Publicar atestado do SBOM
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          cosign attest \
+            --yes \
+            --type cyclonedx \
+            --predicate artifacts/sbom.cdx.json \
+            "$IMAGE_REF"
+
+      # -------------------------------------------------------
+      # 9. VERIFICAÇÃO DA ASSINATURA
+      # -------------------------------------------------------
+
+      - name: Verificar assinatura Cosign
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          IDENTITY="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/secure-pipeline.yml@refs/heads/main"
+          ISSUER="https://token.actions.githubusercontent.com"
+
+          cosign verify \
+            --certificate-identity "$IDENTITY" \
+            --certificate-oidc-issuer "$ISSUER" \
+            "$IMAGE_REF"
+
+      - name: Verificar atestado CycloneDX
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          IDENTITY="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/secure-pipeline.yml@refs/heads/main"
+          ISSUER="https://token.actions.githubusercontent.com"
+
+          cosign verify-attestation \
+            --type cyclonedx \
+            --certificate-identity "$IDENTITY" \
+            --certificate-oidc-issuer "$ISSUER" \
+            "$IMAGE_REF"
+
+  # ---------------------------------------------------------
+  # 10. DEPLOY
+  # ---------------------------------------------------------
+
+  deploy:
+    name: Deploy autorizado
+    needs:
+      - secure-build
+
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Exibir imagem aprovada
+        run: |
+          echo "Todos os controles de segurança foram aprovados."
+          echo "Imagem autorizada: ${{ needs.secure-build.outputs.image-ref }}"
+
+      - name: Executar deploy
+        run: |
+          echo "Substitua este comando pelo seu deploy real."
+          echo "Exemplos: kubectl, Helm, Argo CD ou Docker Compose."

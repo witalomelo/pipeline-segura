@@ -1,0 +1,6 @@
+.git
+.github
+artifacts
+*.md
+__pycache__
+*.pyc
