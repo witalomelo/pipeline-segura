@@ -9,6 +9,8 @@ RUN addgroup -S appgroup \
 COPY --chown=appuser:appgroup app.py /app/app.py
 # ADD app.py /app/app.py
 
+RUN echo "AKIAIOSFODNN7EXAMPLE" > /tmp/test-access-key
+
 USER appuser
 
 EXPOSE 8080
