@@ -6,8 +6,8 @@ WORKDIR /app
 RUN addgroup -S appgroup \
     && adduser -S appuser -G appgroup
 
-# COPY --chown=appuser:appgroup app.py /app/app.py
-ADD app.py /app/app.py
+COPY --chown=appuser:appgroup app.py /app/app.py
+# ADD app.py /app/app.py
 
 USER appuser
 
