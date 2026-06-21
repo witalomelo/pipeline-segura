@@ -7,7 +7,12 @@ RUN addgroup -S appgroup \
     && adduser -S appuser -G appgroup
 
 COPY --chown=appuser:appgroup app.py /app/app.py
-# ADD app.py /app/app.py
+
+# Teste temporário para validar o bloqueio do Trivy
+RUN printf '%s\n' \
+  'AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE' \
+  'AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY' \
+  > /app/test-secret.env
 
 USER appuser
 
