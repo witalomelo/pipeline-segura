@@ -1,10 +1,10 @@
-FROM python:3.13-alpine
+FROM python:3.13-slim-bookworm
 
 WORKDIR /app
 
 # Usuário sem privilégios para executar a aplicação.
-RUN addgroup -S appgroup \
-    && adduser -S appuser -G appgroup
+RUN groupadd -r appgroup \
+    && useradd -r -g appgroup appuser
 
 COPY --chown=appuser:appgroup app.py /app/app.py
 # ADD app.py /app/app.py
