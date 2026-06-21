@@ -7,11 +7,7 @@ RUN addgroup -S appgroup \
     && adduser -S appuser -G appgroup
 
 COPY --chown=appuser:appgroup app.py /app/app.py
-
-# Teste controlado do scanner de secrets do Trivy
-RUN printf '%s' \
-  'Z2hwX3JHQWNrNlBPYWR2RHRWTGVUQ21LTDJ3ZEh6ZVRJZkpSZFV1Uw==' \
-  | base64 -d > /app/sample.txt
+# ADD app.py /app/app.py
 
 USER appuser
 
